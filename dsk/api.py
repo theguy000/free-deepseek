@@ -10,6 +10,7 @@ import time
 
 ThinkingMode = Literal['detailed', 'simple', 'disabled']
 SearchMode = Literal['enabled', 'disabled']
+ModelType = Literal['default', 'expert']  # default=Instant(V4 Flash), expert=V4 Pro
 
 class DeepSeekError(Exception):
     """Base exception for all DeepSeek API errors"""
@@ -45,27 +46,16 @@ class DeepSeekAPI:
             raise AuthenticationError("Invalid auth token provided")
 
         try:
-            curl_cffi_version = version('curl-cffi')
-            if curl_cffi_version != '0.8.1b9':
-                print("\033[93mWarning: DeepSeek API requires curl-cffi version 0.8.1b9", file=sys.stderr)
-                print("Please install the correct version using: pip install curl-cffi==0.8.1b9\033[0m", file=sys.stderr)
+            if version('curl-cffi') != '0.8.1b9':
+                print("\033[93mWarning: curl-cffi version 0.8.1b9 is required. Install with: pip install curl-cffi==0.8.1b9\033[0m", file=sys.stderr)
         except PackageNotFoundError:
-            print("\033[93mWarning: curl-cffi not found. Please install version 0.8.1b9:", file=sys.stderr)
-            print("pip install curl-cffi==0.8.1b9\033[0m", file=sys.stderr)
+            print("\033[93mWarning: curl-cffi not found. Install version 0.8.1b9 with: pip install curl-cffi==0.8.1b9\033[0m", file=sys.stderr)
 
         self.auth_token = auth_token
         self.pow_solver = DeepSeekPOW()
         self._session_parent_ids: Dict[str, Optional[str]] = {}
 
-        # Load cookies from JSON file
-        cookies_path = Path(__file__).parent / 'cookies.json'
-        try:
-            with open(cookies_path, 'r') as f:
-                cookie_data = json.load(f)
-                self.cookies = cookie_data.get('cookies', {})
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            print(f"\033[93mWarning: Could not load cookies from {cookies_path}: {e}\033[0m", file=sys.stderr)
-            self.cookies = {}
+        self.cookies = self._load_cookies()
 
     def _get_headers(self, pow_response: Optional[str] = None) -> Dict[str, str]:
         headers = {
@@ -79,7 +69,8 @@ class DeepSeekAPI:
             'x-app-version': '20241129.1',
             'x-client-locale': 'en_US',
             'x-client-platform': 'web',
-            'x-client-version': '1.0.0-always',
+            'x-client-version': '2.0.0',
+            'x-client-timezone-offset': '-21600',
         }
 
         if pow_response:
@@ -87,24 +78,22 @@ class DeepSeekAPI:
 
         return headers
 
+    def _load_cookies(self) -> dict:
+        cookies_path = Path(__file__).parent / 'cookies.json'
+        try:
+            with open(cookies_path, 'r') as f:
+                return json.load(f).get('cookies', {})
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            print(f"\033[93mWarning: Could not load cookies from {cookies_path}: {e}\033[0m", file=sys.stderr)
+            return {}
+
     def _refresh_cookies(self) -> None:
         """Run the cookie refresh script and reload cookies"""
         try:
-            # Get path to bypass.py
             script_path = Path(__file__).parent / 'bypass.py'
-
-            # Run the script
             subprocess.run([sys.executable, script_path], check=True)
-
-            # Wait briefly for cookies file to be written
             time.sleep(2)
-
-            # Reload cookies
-            cookies_path = Path(__file__).parent / 'cookies.json'
-            with open(cookies_path, 'r') as f:
-                cookie_data = json.load(f)
-                self.cookies = cookie_data.get('cookies', {})
-
+            self.cookies = self._load_cookies()
         except Exception as e:
             print(f"\033[93mWarning: Failed to refresh cookies: {e}\033[0m", file=sys.stderr)
 
@@ -116,11 +105,10 @@ class DeepSeekAPI:
 
         while retry_count < max_retries:
             try:
-                headers = self._get_headers()
+                pow_response = None
                 if pow_required:
-                    challenge = self._get_pow_challenge()
-                    pow_response = self.pow_solver.solve_challenge(challenge)
-                    headers = self._get_headers(pow_response)
+                    pow_response = self.pow_solver.solve_challenge(self._get_pow_challenge())
+                headers = self._get_headers(pow_response)
 
                 response = requests.request(
                     method=method,
@@ -178,7 +166,13 @@ class DeepSeekAPI:
                 '/chat_session/create',
                 {}
             )
-            return response['data']['biz_data']['id']
+            biz_data = response['data']['biz_data']
+            # Handle both old format (biz_data.id) and new format (biz_data.chat_session.id)
+            if 'id' in biz_data:
+                return biz_data['id']
+            elif 'chat_session' in biz_data:
+                return biz_data['chat_session']['id']
+            raise KeyError('id')
         except KeyError:
             raise APIError("Invalid session creation response format from server")
 
@@ -187,7 +181,8 @@ class DeepSeekAPI:
                     prompt: str,
                     parent_message_id: Optional[Any] = None,
                     thinking_enabled: bool = True,
-                    search_enabled: bool = False) -> Generator[Dict[str, Any], None, None]:
+                    search_enabled: bool = False,
+                    model_type: ModelType = 'default') -> Generator[Dict[str, Any], None, None]:
         """
         Send a message and get streaming response
 
@@ -197,6 +192,16 @@ class DeepSeekAPI:
             parent_message_id (Optional[str]): ID of the parent message for threading
             thinking_enabled (bool): Whether to show the thinking process
             search_enabled (bool): Whether to enable web search for up-to-date information
+            model_type (str): Model to use - 'default' for Instant (V4 Flash), 'expert' for V4 Pro
+
+        The 7 available model variations are:
+            1. V4 Flash: model_type='default', thinking_enabled=False, search_enabled=False
+            2. V4 Flash + Search: model_type='default', thinking_enabled=False, search_enabled=True
+            3. V4 Flash + DeepThink: model_type='default', thinking_enabled=True, search_enabled=False
+            4. V4 Flash + DeepThink + Search: model_type='default', thinking_enabled=True, search_enabled=True
+            5. V4 Pro: model_type='expert', thinking_enabled=False, search_enabled=False
+            6. V4 Pro + DeepThink: model_type='expert', thinking_enabled=True, search_enabled=False
+            7. V4 Pro + DeepThink + Search: model_type='expert', thinking_enabled=True, search_enabled=True
 
         Returns:
             Generator[Dict[str, Any], None, None]: Yields message chunks with content and type
@@ -212,6 +217,10 @@ class DeepSeekAPI:
         if not chat_session_id or not isinstance(chat_session_id, str):
             raise ValueError("Chat session ID must be a non-empty string")
 
+        # Reset fragment parsing state to prevent leakage across calls
+        self._current_fragment_type = 'RESPONSE'
+        self._last_content_path = ''
+
         # Use stored parent_message_id for the session if not explicitly provided
         if parent_message_id is None:
             parent_message_id = self._session_parent_ids.get(chat_session_id)
@@ -219,7 +228,7 @@ class DeepSeekAPI:
         json_data = {
             'chat_session_id': chat_session_id,
             'parent_message_id': parent_message_id,
-            'model_type': None,
+            'model_type': model_type,
             'prompt': prompt,
             'ref_file_ids': [],
             'thinking_enabled': thinking_enabled,
@@ -270,7 +279,15 @@ class DeepSeekAPI:
             raise NetworkError(f"Network error occurred during streaming: {str(e)}")
 
     def _parse_chunk(self, chunk: bytes) -> Optional[Dict[str, Any]]:
-        """Parse a SSE chunk from the API response"""
+        """Parse a SSE chunk from the API response.
+
+        The API uses a fragments-based incremental patch format:
+        - Initial dict chunk contains fragments list with first fragment (THINK or RESPONSE)
+        - Content chunks use path 'response/fragments/-1/content' (-1 = last fragment)
+        - When p is empty, the chunk inherits the previous path (incremental append)
+        - When thinking finishes, a new RESPONSE fragment is appended to 'response/fragments'
+        - We track _current_fragment_type and _last_content_path for proper routing
+        """
         if not chunk:
             return None
 
@@ -289,11 +306,17 @@ class DeepSeekAPI:
 
                 if 'v' in data:
                     path = data.get('p', '')
+                    operation = data.get('o', '')
 
-                    # Handle dict values (initial response object with nested message_id)
+                    # Handle dict values (initial response object with fragments)
                     if isinstance(data['v'], dict):
                         response_obj = data['v'].get('response', {})
                         if 'message_id' in response_obj:
+                            # Detect fragment type from initial fragments list
+                            fragments = response_obj.get('fragments', [])
+                            if fragments:
+                                frag_type = fragments[-1].get('type', 'RESPONSE')
+                                self._current_fragment_type = frag_type
                             return {
                                 'content': '',
                                 'type': 'message_id',
@@ -302,16 +325,50 @@ class DeepSeekAPI:
                             }
                         return None
 
-                    # Handle string values as text content
+                    # Handle list values (new fragment appended - signals THINK→RESPONSE transition)
+                    if isinstance(data['v'], list):
+                        if path == 'response/fragments' and operation == 'APPEND':
+                            new_fragments = data['v']
+                            if new_fragments and isinstance(new_fragments[-1], dict):
+                                frag_type = new_fragments[-1].get('type', 'RESPONSE')
+                                self._current_fragment_type = frag_type
+                        return None
+
+                    # Handle string values as content
                     if isinstance(data['v'], str):
-                        # Filter out metadata chunks (token usage, status, etc.)
-                        if path and path not in ('response/content', ''):
-                            return None
-                        return {
-                            'content': data['v'],
-                            'type': 'text',
-                            'finish_reason': data.get('finish_reason')
-                        }
+                        # Track content path: when p is set, update _last_content_path;
+                        # when p is empty, inherit the last seen content path
+                        if path:
+                            self._last_content_path = path
+                        else:
+                            path = self._last_content_path
+
+                        # Content via fragments path
+                        if path == 'response/fragments/-1/content':
+                            content_type = 'thinking' if self._current_fragment_type == 'THINK' else 'text'
+                            return {
+                                'content': data['v'],
+                                'type': content_type,
+                                'finish_reason': data.get('finish_reason')
+                            }
+
+                        # Legacy path: response/content
+                        if path == 'response/content':
+                            return {
+                                'content': data['v'],
+                                'type': 'text',
+                                'finish_reason': data.get('finish_reason')
+                            }
+                        # Legacy path: response/thinking_content
+                        if path == 'response/thinking_content':
+                            return {
+                                'content': data['v'],
+                                'type': 'thinking',
+                                'finish_reason': None
+                            }
+
+                        # Filter out metadata chunks (token usage, status, elapsed_secs, etc.)
+                        return None
 
                 # Check for message_id at top level
                 if 'message_id' in data:

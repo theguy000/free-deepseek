@@ -3,6 +3,7 @@ import re
 import os
 import hashlib
 import shutil
+import time
 from pathlib import Path
 from collections import OrderedDict
 from urllib.parse import urlparse
@@ -26,7 +27,7 @@ import atexit
 load_dotenv()
 
 # Import DeepSeekAPI
-from .api import DeepSeekAPI, AuthenticationError, RateLimitError, NetworkError, APIError
+from .api import DeepSeekAPI, AuthenticationError, RateLimitError, NetworkError, APIError, ModelType
 
 # Check if running in Docker mode
 DOCKER_MODE = os.getenv("DOCKERMODE", "false").lower() == "true"
@@ -150,17 +151,19 @@ class ChatMessage(BaseModel):
     model_config = {"extra": "ignore"}
     role: Literal["system", "user", "assistant", "tool", "function"]
     content: Union[str, List[Any]]
+    reasoning_content: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
     model_config = {"extra": "ignore"}
-    model: str = "deepseek-chat"
+    model: str = "deepseek-v4-flash"
     messages: List[ChatMessage]
     temperature: Optional[float] = 1.0
     max_tokens: Optional[int] = None
     stream: Optional[bool] = False
-    thinking_enabled: Optional[bool] = True
-    search_enabled: Optional[bool] = False
+    thinking_enabled: Optional[bool] = None
+    search_enabled: Optional[bool] = None
+    model_type: Optional[ModelType] = None  # 'default'=Instant(V4 Flash), 'expert'=V4 Pro; auto-resolved from model field if not set
     conversation_id: Optional[str] = None
 
 
@@ -187,6 +190,7 @@ class ChatCompletionResponse(BaseModel):
 
 class ChatCompletionChunkDelta(BaseModel):
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     role: Optional[Literal["assistant"]] = None
 
 
@@ -304,6 +308,106 @@ async def get_html(url: str, retries: int = 5, proxy: str = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Model name resolution helper
+MODEL_MAP = {
+    'deepseek-v4-flash':              {'model_type': 'default', 'thinking_enabled': False, 'search_enabled': False},
+    'deepseek-v4-flash-search':       {'model_type': 'default', 'thinking_enabled': False, 'search_enabled': True},
+    'deepseek-v4-flash-deepthink':         {'model_type': 'default', 'thinking_enabled': True,  'search_enabled': False},
+    'deepseek-v4-flash-deepthink-search':  {'model_type': 'default', 'thinking_enabled': True,  'search_enabled': True},
+    'deepseek-v4-pro':                 {'model_type': 'expert',   'thinking_enabled': False, 'search_enabled': False},
+    'deepseek-v4-pro-deepthink':            {'model_type': 'expert',   'thinking_enabled': True,  'search_enabled': False},
+    'deepseek-v4-pro-deepthink-search':     {'model_type': 'expert',   'thinking_enabled': True,  'search_enabled': True},
+}
+
+def _resolve_model(model: str, model_type=None, thinking_enabled=None, search_enabled=None):
+    """Resolve model name to (model_type, thinking_enabled, search_enabled).
+    Explicit params take precedence over model name mapping."""
+    resolved = MODEL_MAP.get(model.lower(), MODEL_MAP['deepseek-v4-flash'])
+    return (
+        model_type if model_type is not None else resolved['model_type'],
+        thinking_enabled if thinking_enabled is not None else resolved['thinking_enabled'],
+        search_enabled if search_enabled is not None else resolved['search_enabled'],
+    )
+
+
+# OpenAI-compatible models endpoint
+@app.get("/v1/models")
+async def list_models():
+    models = [
+        {
+            "id": "deepseek-v4-flash",
+            "object": "model",
+            "created": 1740000000,
+            "owned_by": "deepseek",
+            "description": "DeepSeek V4 Flash - no thinking, no search",
+            "model_type": "default",
+            "thinking_enabled": False,
+            "search_enabled": False,
+        },
+        {
+            "id": "deepseek-v4-flash-search",
+            "object": "model",
+            "created": 1740000000,
+            "owned_by": "deepseek",
+            "description": "DeepSeek V4 Flash + Search",
+            "model_type": "default",
+            "thinking_enabled": False,
+            "search_enabled": True,
+        },
+        {
+            "id": "deepseek-v4-flash-deepthink",
+            "object": "model",
+            "created": 1740000000,
+            "owned_by": "deepseek",
+            "description": "DeepSeek V4 Flash + DeepThink",
+            "model_type": "default",
+            "thinking_enabled": True,
+            "search_enabled": False,
+        },
+        {
+            "id": "deepseek-v4-flash-deepthink-search",
+            "object": "model",
+            "created": 1740000000,
+            "owned_by": "deepseek",
+            "description": "DeepSeek V4 Flash + DeepThink + Search",
+            "model_type": "default",
+            "thinking_enabled": True,
+            "search_enabled": True,
+        },
+        {
+            "id": "deepseek-v4-pro",
+            "object": "model",
+            "created": 1740000000,
+            "owned_by": "deepseek",
+            "description": "DeepSeek V4 Pro - no thinking, no search",
+            "model_type": "expert",
+            "thinking_enabled": False,
+            "search_enabled": False,
+        },
+        {
+            "id": "deepseek-v4-pro-deepthink",
+            "object": "model",
+            "created": 1740000000,
+            "owned_by": "deepseek",
+            "description": "DeepSeek V4 Pro + DeepThink",
+            "model_type": "expert",
+            "thinking_enabled": True,
+            "search_enabled": False,
+        },
+        {
+            "id": "deepseek-v4-pro-deepthink-search",
+            "object": "model",
+            "created": 1740000000,
+            "owned_by": "deepseek",
+            "description": "DeepSeek V4 Pro + DeepThink + Search",
+            "model_type": "expert",
+            "thinking_enabled": True,
+            "search_enabled": True,
+        },
+    ]
+    return {"object": "list", "data": models}
+
+
 # OpenAI-compatible chat completions endpoint
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
@@ -350,7 +454,6 @@ async def chat_completions(request: ChatCompletionRequest):
         session_mgr.put(store_key, {'session_id': session_id, 'parent_message_id': parent_message_id})
         
         # Generate a unique ID for this completion
-        import time
         completion_id = f"chatcmpl-{int(time.time())}"
         created = int(time.time())
         
@@ -358,12 +461,18 @@ async def chat_completions(request: ChatCompletionRequest):
             async def stream_generator():
                 captured_message_id = None
                 try:
+                    # Resolve model_type, thinking_enabled, search_enabled from model name
+                    model_type, thinking_enabled, search_enabled = _resolve_model(
+                        request.model, request.model_type, request.thinking_enabled, request.search_enabled
+                    )
+
                     chunks = api.chat_completion(
                         session_id,
                         prompt,
                         parent_message_id=parent_message_id,
-                        thinking_enabled=request.thinking_enabled,
-                        search_enabled=request.search_enabled
+                        thinking_enabled=thinking_enabled,
+                        search_enabled=search_enabled,
+                        model_type=model_type
                     )
                     
                     # Send first chunk with role
@@ -386,7 +495,19 @@ async def chat_completions(request: ChatCompletionRequest):
                             captured_message_id = chunk['message_id']
                             print(f"[session] Captured message_id: {captured_message_id}")
                             continue
-                        if chunk['type'] == 'text' and chunk['content']:
+                        if chunk['type'] == 'thinking' and chunk['content']:
+                            thinking_chunk = ChatCompletionChunk(
+                                id=completion_id,
+                                created=created,
+                                model=request.model,
+                                choices=[ChatCompletionChunkChoice(
+                                    index=0,
+                                    delta=ChatCompletionChunkDelta(reasoning_content=chunk['content']),
+                                    finish_reason=None
+                                )]
+                            )
+                            yield f"data: {thinking_chunk.model_dump_json()}\n\n"
+                        elif chunk['type'] == 'text' and chunk['content']:
                             content_chunk = ChatCompletionChunk(
                                 id=completion_id,
                                 created=created,
@@ -438,19 +559,28 @@ async def chat_completions(request: ChatCompletionRequest):
         else:
             # Non-streaming response
             full_content = ""
+            reasoning_content = ""
             captured_message_id = None
+            # Resolve model_type, thinking_enabled, search_enabled from model name
+            model_type, thinking_enabled, search_enabled = _resolve_model(
+                request.model, request.model_type, request.thinking_enabled, request.search_enabled
+            )
+
             chunks = api.chat_completion(
                 session_id,
                 prompt,
                 parent_message_id=parent_message_id,
-                thinking_enabled=request.thinking_enabled,
-                search_enabled=request.search_enabled
+                thinking_enabled=thinking_enabled,
+                search_enabled=search_enabled,
+                model_type=model_type
             )
             
             for chunk in chunks:
                 if chunk.get('type') == 'message_id' and chunk.get('message_id'):
                     captured_message_id = chunk['message_id']
                     print(f"[session] Captured message_id: {captured_message_id}")
+                elif chunk['type'] == 'thinking':
+                    reasoning_content += chunk['content']
                 elif chunk['type'] == 'text':
                     full_content += chunk['content']
             
@@ -459,13 +589,14 @@ async def chat_completions(request: ChatCompletionRequest):
                 session_mgr.update_parent_message_id(store_key, captured_message_id)
                 print(f"[session] Updated parent_message_id for key={store_key[:8]}… → {captured_message_id}")
             
+            # Build message with optional reasoning_content
             response = ChatCompletionResponse(
                 id=completion_id,
                 created=created,
                 model=request.model,
                 choices=[ChatCompletionResponseChoice(
                     index=0,
-                    message=ChatMessage(role="assistant", content=full_content),
+                    message=ChatMessage(role="assistant", content=full_content, reasoning_content=reasoning_content or None),
                     finish_reason="stop"
                 )],
                 usage=ChatCompletionResponseUsage(
