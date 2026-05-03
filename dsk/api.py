@@ -2,7 +2,7 @@ from curl_cffi import requests
 from typing import Optional, Dict, Any, Generator, Literal
 import json
 from .pow import DeepSeekPOW
-import pkg_resources
+from importlib.metadata import version, PackageNotFoundError
 import sys
 from pathlib import Path
 import subprocess
@@ -45,11 +45,11 @@ class DeepSeekAPI:
             raise AuthenticationError("Invalid auth token provided")
 
         try:
-            curl_cffi_version = pkg_resources.get_distribution('curl-cffi').version
+            curl_cffi_version = version('curl-cffi')
             if curl_cffi_version != '0.8.1b9':
                 print("\033[93mWarning: DeepSeek API requires curl-cffi version 0.8.1b9", file=sys.stderr)
                 print("Please install the correct version using: pip install curl-cffi==0.8.1b9\033[0m", file=sys.stderr)
-        except pkg_resources.DistributionNotFound:
+        except PackageNotFoundError:
             print("\033[93mWarning: curl-cffi not found. Please install version 0.8.1b9:", file=sys.stderr)
             print("pip install curl-cffi==0.8.1b9\033[0m", file=sys.stderr)
 
@@ -267,6 +267,34 @@ class DeepSeekAPI:
         try:
             if chunk.startswith(b'data: '):
                 data = json.loads(chunk[6:])
+
+                if 'v' in data and isinstance(data['v'], str):
+                    path = data.get('p', '')
+                    # Extract message_id for threading
+                    if path == 'response/message_id':
+                        return {
+                            'content': '',
+                            'type': 'message_id',
+                            'message_id': data['v'],
+                            'finish_reason': None
+                        }
+                    # Filter out metadata chunks (token usage, status, etc.)
+                    if path and path != 'response/content':
+                        return None
+                    return {
+                        'content': data['v'],
+                        'type': 'text',
+                        'finish_reason': 'finish_reason'
+                    }
+
+                # Check for message_id at top level
+                if 'message_id' in data:
+                    return {
+                        'content': '',
+                        'type': 'message_id',
+                        'message_id': data['message_id'],
+                        'finish_reason': None
+                    }
 
                 if 'choices' in data and data['choices']:
                     choice = data['choices'][0]

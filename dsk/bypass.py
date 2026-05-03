@@ -5,11 +5,12 @@ import sys
 import time
 import requests
 import json
+import socket
 
 def validate_cookies(cookies_data):
-    """Validate that cf_clearance cookie is present and not empty"""
+    """Validate that cookies were returned (cf_clearance is only present when Cloudflare is active)"""
     cookies = cookies_data.get('cookies', {})
-    return 'cf_clearance' in cookies and cookies['cf_clearance'].strip() != ''
+    return bool(cookies)
 
 def get_and_save_cookies(server_url, cookie_file_path, max_retries=3):
     for attempt in range(max_retries):
@@ -19,7 +20,7 @@ def get_and_save_cookies(server_url, cookie_file_path, max_retries=3):
             cookies_data = response.json()
 
             if not validate_cookies(cookies_data):
-                print(f"Attempt {attempt + 1}: cf_clearance cookie not found, retrying...")
+                print(f"Attempt {attempt + 1}: No cookies returned, retrying...")
                 time.sleep(5)
                 continue
 
@@ -45,6 +46,10 @@ def get_and_save_cookies(server_url, cookie_file_path, max_retries=3):
     print("Failed to obtain valid cf_clearance cookie after all attempts")
     return False
 
+def is_port_in_use(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(('localhost', port)) == 0
+
 def run_server_background():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     server_script = os.path.abspath(os.path.join(script_dir, "server.py"))
@@ -56,32 +61,47 @@ def run_server_background():
         process = subprocess.Popen(
             [sys.executable, server_script],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             cwd=server_dir,
             start_new_session=True
         )
+        # Give the server a moment to start; check if it crashed immediately
+        time.sleep(2)
+        if process.poll() is not None:
+            stderr_output = process.stderr.read().decode('utf-8', errors='replace')
+            print(f"Server failed to start:\n{stderr_output}")
+            return None
         return process
-    except Exception:
+    except Exception as e:
+        print(f"Failed to start server: {e}")
         return None
 
 if __name__ == "__main__":
     print("Getting the cookies...")
-    server_process = run_server_background()
+    server_url = "http://localhost:8000/cookies?url=https://chat.deepseek.com"
+    cookie_file = "dsk/cookies.json"
+    server_process = None
+    owns_server = False
 
-    if server_process:
-        # Increase initial wait time to ensure server is fully started
-        time.sleep(10)
-        server_url = "http://localhost:8000/cookies?url=https://chat.deepseek.com"
-        cookie_file = "dsk/cookies.json"
-
-        # Increase max retries for more reliability
-        success = get_and_save_cookies(server_url, cookie_file, max_retries=5)
-
-        if not success:
-            print("Failed to obtain valid cookies.")
-            server_process.terminate()
-            sys.exit(1)
-        server_process.terminate()
+    if is_port_in_use(8000):
+        print("Server already running on port 8000, reusing it.")
     else:
-        print("Failed to start server.")
+        server_process = run_server_background()
+        if server_process:
+            owns_server = True
+            # Wait for server to be fully started
+            time.sleep(10)
+        else:
+            print("Failed to start server.")
+            sys.exit(1)
+
+    # Increase max retries for more reliability
+    success = get_and_save_cookies(server_url, cookie_file, max_retries=5)
+
+    if not success:
+        print("Failed to obtain valid cookies.")
+        if owns_server and server_process:
+            server_process.terminate()
         sys.exit(1)
+    if owns_server and server_process:
+        server_process.terminate()
