@@ -1,6 +1,8 @@
 from curl_cffi import requests
 from typing import Optional, Dict, Any, Generator, Literal
 import json
+import queue
+import threading
 from .pow import DeepSeekPOW
 from importlib.metadata import version, PackageNotFoundError
 import sys
@@ -219,9 +221,8 @@ class DeepSeekAPI:
         if not chat_session_id or not isinstance(chat_session_id, str):
             raise ValueError("Chat session ID must be a non-empty string")
 
-        # Reset fragment parsing state to prevent leakage across calls
-        self._current_fragment_type = 'RESPONSE'
-        self._last_content_path = ''
+        # Per-call parsing context (thread-safe — not stored on self)
+        _parse_ctx = {'fragment_type': 'RESPONSE', 'last_content_path': ''}
 
         # Use stored parent_message_id for the session if not explicitly provided
         if parent_message_id is None:
@@ -239,6 +240,58 @@ class DeepSeekAPI:
             'preempt': False,
         }
 
+        # Use content_callback + queue to avoid curl_cffi heap corruption
+        # (the stream=True / iter_lines() path triggers a double-free in libcurl cleanup)
+        chunk_queue: queue.Queue = queue.Queue()
+        _SENTINEL = object()
+        _line_buffer = bytearray()
+
+        def _on_data(data: bytes):
+            """Callback invoked by libcurl for each chunk of response data."""
+            nonlocal _line_buffer
+            _line_buffer.extend(data)
+            # Split on newlines; SSE lines are \n-delimited
+            while b'\n' in _line_buffer:
+                line, _, _line_buffer = _line_buffer.partition(b'\n')
+                line = line.strip()
+                if line:
+                    chunk_queue.put(line)
+
+        _request_error = [None]  # mutable container to pass error from thread
+        _response_holder = [None]  # keep response alive to prevent premature GC
+
+        def _do_request():
+            try:
+                resp = requests.post(
+                    f"{self.BASE_URL}/chat/completion",
+                    headers=headers,
+                    json=json_data,
+                    cookies=self.cookies,
+                    impersonate='chrome120',
+                    content_callback=_on_data,
+                    timeout=None,
+                )
+                _response_holder[0] = resp
+                # Push any remaining data in the line buffer
+                remaining = _line_buffer.strip()
+                if remaining:
+                    chunk_queue.put(bytes(remaining))
+                # Check status code
+                if resp.status_code != 200:
+                    error_text = resp.text if hasattr(resp, 'text') else ''
+                    if resp.status_code == 401:
+                        _request_error[0] = AuthenticationError("Invalid or expired authentication token")
+                    elif resp.status_code == 429:
+                        _request_error[0] = RateLimitError("API rate limit exceeded")
+                    else:
+                        _request_error[0] = APIError(f"API request failed: {error_text}", resp.status_code)
+            except requests.exceptions.RequestException as e:
+                _request_error[0] = NetworkError(f"Network error occurred during streaming: {str(e)}")
+            except Exception as e:
+                _request_error[0] = APIError(f"Request error: {str(e)}")
+            finally:
+                chunk_queue.put(_SENTINEL)
+
         try:
             headers = self._get_headers(
                 pow_response=self.pow_solver.solve_challenge(
@@ -246,43 +299,59 @@ class DeepSeekAPI:
                 )
             )
 
-            response = requests.post(
-                f"{self.BASE_URL}/chat/completion",
-                headers=headers,
-                json=json_data,
-                cookies=self.cookies,  # Add cookies
-                impersonate='chrome120',
-                stream=True,
-                timeout=None
-            )
+            # Run the blocking request in a background thread
+            request_thread = threading.Thread(target=_do_request, daemon=True)
+            request_thread.start()
 
-            if response.status_code != 200:
-                error_text = next(response.iter_lines(), b'').decode('utf-8', 'ignore')
-                if response.status_code == 401:
-                    raise AuthenticationError("Invalid or expired authentication token")
-                elif response.status_code == 429:
-                    raise RateLimitError("API rate limit exceeded")
-                else:
-                    raise APIError(f"API request failed: {error_text}", response.status_code)
-
-            for chunk in response.iter_lines():
+            while True:
                 try:
-                    parsed = self._parse_chunk(chunk)
-                    if parsed:
+                    item = chunk_queue.get(timeout=120)
+                except queue.Empty:
+                    raise APIError("Streaming response timed out")
+
+                if item is _SENTINEL:
+                    # Request finished — check for errors
+                    if _request_error[0]:
+                        raise _request_error[0]
+                    break
+
+                try:
+                    parsed_events = self._parse_chunk(item, _parse_ctx)
+                    for parsed in parsed_events:
                         # Track message_id for conversation threading
                         if parsed.get('type') == 'message_id':
                             self._session_parent_ids[chat_session_id] = parsed['message_id']
                         yield parsed
                         if parsed.get('finish_reason') == 'stop':
-                            break
+                            return
                 except Exception as e:
                     raise APIError(f"Error parsing response chunk: {str(e)}")
 
+            # Wait for the thread to fully finish to prevent premature cleanup
+            request_thread.join(timeout=5)
+
+        except (AuthenticationError, RateLimitError, NetworkError, APIError):
+            raise
         except requests.exceptions.RequestException as e:
             raise NetworkError(f"Network error occurred during streaming: {str(e)}")
 
-    def _parse_chunk(self, chunk: bytes) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _frag_content(frag: dict) -> list[Dict[str, Any]]:
+        """Extract content events from a single fragment dict."""
+        content = frag.get('content', '')
+        if not content:
+            return []
+        ct = 'thinking' if frag.get('type', 'RESPONSE') == 'THINK' else 'text'
+        return [{'content': content, 'type': ct, 'finish_reason': None}]
+
+    @staticmethod
+    def _msg_id_event(message_id: str) -> Dict[str, Any]:
+        return {'content': '', 'type': 'message_id', 'message_id': message_id, 'finish_reason': None}
+
+    def _parse_chunk(self, chunk: bytes, ctx: Dict[str, str]) -> list[Dict[str, Any]]:
         """Parse a SSE chunk from the API response.
+
+        Returns a list of event dicts (may be empty, one, or multiple).
 
         The API uses a fragments-based incremental patch format:
         - Initial dict chunk contains fragments list with first fragment (THINK or RESPONSE)
@@ -292,109 +361,83 @@ class DeepSeekAPI:
         - We track _current_fragment_type and _last_content_path for proper routing
         """
         if not chunk:
-            return None
+            return []
 
         try:
-            if chunk.startswith(b'data: '):
-                data = json.loads(chunk[6:])
+            if not chunk.startswith(b'data: '):
+                return []
 
-                # Check for top-level response_message_id (first chunk of response)
-                if 'response_message_id' in data:
-                    return {
-                        'content': '',
-                        'type': 'message_id',
-                        'message_id': data['response_message_id'],
-                        'finish_reason': None
-                    }
+            data = json.loads(chunk[6:])
 
-                if 'v' in data:
-                    path = data.get('p', '')
-                    operation = data.get('o', '')
+            # Check for top-level response_message_id (first chunk of response)
+            if 'response_message_id' in data:
+                return [self._msg_id_event(data['response_message_id'])]
 
-                    # Handle dict values (initial response object with fragments)
-                    if isinstance(data['v'], dict):
-                        response_obj = data['v'].get('response', {})
-                        if 'message_id' in response_obj:
-                            # Detect fragment type from initial fragments list
-                            fragments = response_obj.get('fragments', [])
-                            if fragments:
-                                frag_type = fragments[-1].get('type', 'RESPONSE')
-                                self._current_fragment_type = frag_type
-                            return {
-                                'content': '',
-                                'type': 'message_id',
-                                'message_id': response_obj['message_id'],
-                                'finish_reason': None
-                            }
-                        return None
+            if 'v' in data:
+                path = data.get('p', '')
+                operation = data.get('o', '')
 
-                    # Handle list values (new fragment appended - signals THINK→RESPONSE transition)
-                    if isinstance(data['v'], list):
-                        if path == 'response/fragments' and operation == 'APPEND':
-                            new_fragments = data['v']
-                            if new_fragments and isinstance(new_fragments[-1], dict):
-                                frag_type = new_fragments[-1].get('type', 'RESPONSE')
-                                self._current_fragment_type = frag_type
-                        return None
+                # Handle dict values (initial response object with fragments)
+                if isinstance(data['v'], dict):
+                    response_obj = data['v'].get('response', {})
+                    if 'message_id' not in response_obj:
+                        return []
+                    results = [self._msg_id_event(response_obj['message_id'])]
+                    fragments = response_obj.get('fragments', [])
+                    if fragments:
+                        ctx['fragment_type'] = fragments[-1].get('type', 'RESPONSE')
+                    for frag in fragments:
+                        results.extend(self._frag_content(frag))
+                    return results
 
-                    # Handle string values as content
-                    if isinstance(data['v'], str):
-                        # Track content path: when p is set, update _last_content_path;
-                        # when p is empty, inherit the last seen content path
-                        if path:
-                            self._last_content_path = path
-                        else:
-                            path = self._last_content_path
+                # Handle list values (new fragment appended - signals THINK→RESPONSE transition)
+                if isinstance(data['v'], list):
+                    if path != 'response/fragments' or operation != 'APPEND':
+                        return []
+                    new_fragments = data['v']
+                    if new_fragments and isinstance(new_fragments[-1], dict):
+                        ctx['fragment_type'] = new_fragments[-1].get('type', 'RESPONSE')
+                    results = []
+                    for frag in new_fragments:
+                        if isinstance(frag, dict):
+                            results.extend(self._frag_content(frag))
+                    return results
 
-                        # Content via fragments path
-                        if path == 'response/fragments/-1/content':
-                            content_type = 'thinking' if self._current_fragment_type == 'THINK' else 'text'
-                            return {
-                                'content': data['v'],
-                                'type': content_type,
-                                'finish_reason': data.get('finish_reason')
-                            }
+                # Handle string values as content
+                if isinstance(data['v'], str):
+                    # Track content path: when p is set, update _last_content_path;
+                    # when p is empty, inherit the last seen content path
+                    if path:
+                        ctx['last_content_path'] = path
+                    else:
+                        path = ctx['last_content_path']
 
-                        # Legacy path: response/content
-                        if path == 'response/content':
-                            return {
-                                'content': data['v'],
-                                'type': 'text',
-                                'finish_reason': data.get('finish_reason')
-                            }
-                        # Legacy path: response/thinking_content
-                        if path == 'response/thinking_content':
-                            return {
-                                'content': data['v'],
-                                'type': 'thinking',
-                                'finish_reason': None
-                            }
+                    # Content via fragments path
+                    if path == 'response/fragments/-1/content':
+                        content_type = 'thinking' if ctx['fragment_type'] == 'THINK' else 'text'
+                        return [{'content': data['v'], 'type': content_type, 'finish_reason': data.get('finish_reason')}]
 
-                        # Filter out metadata chunks (token usage, status, elapsed_secs, etc.)
-                        return None
+                    # Legacy paths
+                    if path == 'response/content':
+                        return [{'content': data['v'], 'type': 'text', 'finish_reason': data.get('finish_reason')}]
+                    if path == 'response/thinking_content':
+                        return [{'content': data['v'], 'type': 'thinking', 'finish_reason': None}]
 
-                # Check for message_id at top level
-                if 'message_id' in data:
-                    return {
-                        'content': '',
-                        'type': 'message_id',
-                        'message_id': data['message_id'],
-                        'finish_reason': None
-                    }
+                    # Filter out metadata chunks (token usage, status, elapsed_secs, etc.)
+                    return []
 
-                if 'choices' in data and data['choices']:
-                    choice = data['choices'][0]
-                    if 'delta' in choice:
-                        delta = choice['delta']
+            # Check for message_id at top level
+            if 'message_id' in data:
+                return [self._msg_id_event(data['message_id'])]
 
-                        return {
-                            'content': delta.get('content', ''),
-                            'type': delta.get('type', ''),
-                            'finish_reason': choice.get('finish_reason')
-                        }
+            if 'choices' in data and data['choices']:
+                choice = data['choices'][0]
+                if 'delta' in choice:
+                    delta = choice['delta']
+                    return [{'content': delta.get('content', ''), 'type': delta.get('type', ''), 'finish_reason': choice.get('finish_reason')}]
         except json.JSONDecodeError:
             raise APIError("Invalid JSON in response chunk")
         except Exception as e:
             raise APIError(f"Error parsing chunk: {str(e)}")
 
-        return None
+        return []

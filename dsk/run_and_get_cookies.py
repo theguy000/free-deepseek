@@ -13,6 +13,12 @@ def get_and_save_cookies(server_url, cookie_file_path):
             response.raise_for_status()
             cookies_data = response.json()
 
+            if not cookies_data.get('cookies'):
+                if attempt < 4:
+                    time.sleep(5)
+                    continue
+                raise Exception("No cookies returned after all attempts")
+
             cookies_to_save = {
                 'cookies': cookies_data.get('cookies', {}),
                 'user_agent': cookies_data.get('user_agent', '')
@@ -54,7 +60,8 @@ if __name__ == "__main__":
 
     if server_process:
         time.sleep(5)
-        server_url = "http://localhost:8000/cookies?url=https://chat.deepseek.com"
+        server_port = int(os.getenv("SERVER_PORT", 5005))
+        server_url = f"http://localhost:{server_port}/cookies?url=https://chat.deepseek.com"
         cookie_file = "dsk/cookies.json"
         get_and_save_cookies(server_url, cookie_file)
     else:

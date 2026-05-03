@@ -78,12 +78,13 @@ def run_server_background():
 
 if __name__ == "__main__":
     print("Getting the cookies...")
-    server_url = "http://localhost:8000/cookies?url=https://chat.deepseek.com"
+    server_port = int(os.getenv("SERVER_PORT", 5005))
+    server_url = f"http://localhost:{server_port}/cookies?url=https://chat.deepseek.com"
     cookie_file = "dsk/cookies.json"
     server_process = None
     owns_server = False
 
-    if is_port_in_use(8000):
+    if is_port_in_use(server_port):
         print("Server already running on port 8000, reusing it.")
     else:
         server_process = run_server_background()

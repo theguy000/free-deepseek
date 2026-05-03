@@ -8,6 +8,7 @@ from pathlib import Path
 from collections import OrderedDict
 from urllib.parse import urlparse
 import sys
+import threading
 
 from .CloudflareBypasser import CloudflareBypasser
 from DrissionPage import ChromiumPage, ChromiumOptions
@@ -25,6 +26,9 @@ except ImportError:
 import uvicorn
 import atexit
 load_dotenv()
+
+# Module-level default so endpoints work when not launched via __main__
+log = True
 
 # Import DeepSeekAPI
 from .api import DeepSeekAPI, AuthenticationError, RateLimitError, NetworkError, APIError, ModelType
@@ -76,7 +80,9 @@ def _build_key(messages: list, include_last_user: bool = False) -> str:
             parts.append(f"u{user_idx}:{content}")
             user_idx += 1
     if not include_last_user and parts and parts[-1].startswith("u"):
-        parts = parts[:-1]
+        # Only strip last user message if other user messages remain to identify the conversation
+        if any(p.startswith("u") for p in parts[:-1]):
+            parts = parts[:-1]
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
 
@@ -90,6 +96,7 @@ class SessionManager:
     def __init__(self, max_sessions: int = MAX_CACHE_SIZE, filepath: Path = SESSIONS_FILE):
         self._max = max_sessions
         self._file = filepath
+        self._lock = threading.Lock()
         self._data: OrderedDict[str, Dict[str, Optional[str]]] = OrderedDict()
         self._load()
 
@@ -115,26 +122,29 @@ class SessionManager:
 
     def get(self, key: str) -> Optional[Dict[str, Optional[str]]]:
         """Look up session info by key."""
-        if key in self._data:
-            self._data.move_to_end(key)
-            return self._data[key]
-        return None
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+                return self._data[key]
+            return None
 
     def put(self, key: str, info: Dict[str, Optional[str]]):
         """Store session info and persist to disk immediately."""
-        if key in self._data:
-            self._data.move_to_end(key)
-        self._data[key] = info
-        while len(self._data) > self._max:
-            evicted_key, _ = self._data.popitem(last=False)
-            print(f"[session] Evicted oldest session {evicted_key[:8]}…")
-        self._save()
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+            self._data[key] = info
+            while len(self._data) > self._max:
+                evicted_key, _ = self._data.popitem(last=False)
+                print(f"[session] Evicted oldest session {evicted_key[:8]}…")
+            self._save()
 
     def update_parent_message_id(self, key: str, parent_message_id: str):
         """Update parent_message_id and persist to disk immediately."""
-        if key in self._data:
-            self._data[key]['parent_message_id'] = parent_message_id
-            self._save()
+        with self._lock:
+            if key in self._data:
+                self._data[key]['parent_message_id'] = parent_message_id
+                self._save()
 
 
 session_mgr = SessionManager()
@@ -215,9 +225,7 @@ def is_safe_url(url: str) -> bool:
         r"^(127\.0\.0\.1|localhost|0\.0\.0\.0|::1|10\.\d+\.\d+\.\d+|172\.1[6-9]\.\d+\.\d+|172\.2[0-9]\.\d+\.\d+|172\.3[0-1]\.\d+\.\d+|192\.168\.\d+\.\d+)$"
     )
     hostname = parsed_url.hostname
-    if (hostname and ip_pattern.match(hostname)) or parsed_url.scheme == "file":
-        return False
-    return True
+    return not ((hostname and ip_pattern.match(hostname)) or parsed_url.scheme == "file")
 
 
 # Function to verify if the page has loaded properly
@@ -233,24 +241,23 @@ def verify_page_loaded(driver: ChromiumPage) -> bool:
 
 
 # Function to bypass Cloudflare protection
+def _build_chrome_options(proxy: str = None) -> ChromiumOptions:
+    options = ChromiumOptions().auto_port().set_paths(browser_path=browser_path).headless(False)
+    if DOCKER_MODE:
+        options.set_argument("--auto-open-devtools-for-tabs", "true")
+        options.set_argument("--remote-debugging-port=9222")
+        options.set_argument("--no-sandbox")  # Necessary for Docker
+        options.set_argument("--disable-gpu")  # Optional, helps in some cases
+    if proxy:
+        options.set_proxy(proxy)
+    return options
+
+
 def bypass_cloudflare(url: str, retries: int, log: bool, proxy: str = None) -> ChromiumPage:
     max_load_retries = 3
 
     for load_attempt in range(max_load_retries):
-        options = ChromiumOptions().auto_port()
-        if DOCKER_MODE:
-            options.set_argument("--auto-open-devtools-for-tabs", "true")
-            options.set_argument("--remote-debugging-port=9222")
-            options.set_argument("--no-sandbox")  # Necessary for Docker
-            options.set_argument("--disable-gpu")  # Optional, helps in some cases
-            options.set_paths(browser_path=browser_path).headless(False)
-        else:
-            options.set_paths(browser_path=browser_path).headless(False)
-
-        if proxy:
-            options.set_proxy(proxy)
-
-        driver = ChromiumPage(addr_or_opts=options)
+        driver = ChromiumPage(addr_or_opts=_build_chrome_options(proxy))
         try:
             driver.get(url)
             # Wait for initial page load
@@ -275,6 +282,10 @@ def bypass_cloudflare(url: str, retries: int, log: bool, proxy: str = None) -> C
             raise e
 
 
+def _extract_cookies(driver: ChromiumPage) -> Dict[str, str]:
+    return {cookie.get("name", ""): cookie.get("value", " ") for cookie in driver.cookies()}
+
+
 # Endpoint to get cookies
 @app.get("/cookies", response_model=CookieResponse)
 async def get_cookies(url: str, retries: int = 5, proxy: str = None):
@@ -282,7 +293,7 @@ async def get_cookies(url: str, retries: int = 5, proxy: str = None):
         raise HTTPException(status_code=400, detail="Invalid URL")
     try:
         driver = bypass_cloudflare(url, retries, log, proxy)
-        cookies = {cookie.get("name", ""): cookie.get("value", " ") for cookie in driver.cookies()}
+        cookies = _extract_cookies(driver)
         user_agent = driver.user_agent
         driver.quit()
         return CookieResponse(cookies=cookies, user_agent=user_agent)
@@ -298,7 +309,7 @@ async def get_html(url: str, retries: int = 5, proxy: str = None):
     try:
         driver = bypass_cloudflare(url, retries, log, proxy)
         html = driver.html
-        cookies_json = {cookie.get("name", ""): cookie.get("value", " ") for cookie in driver.cookies()}
+        cookies_json = _extract_cookies(driver)
         response = Response(content=html, media_type="text/html")
         response.headers["cookies"] = json.dumps(cookies_json)
         response.headers["user_agent"] = driver.user_agent
@@ -333,78 +344,26 @@ def _resolve_model(model: str, model_type=None, thinking_enabled=None, search_en
 # OpenAI-compatible models endpoint
 @app.get("/v1/models")
 async def list_models():
-    models = [
-        {
-            "id": "deepseek-v4-flash",
+    _MODEL_LABELS = {'default': 'V4 Flash', 'expert': 'V4 Pro'}
+    models = []
+    for mid, cfg in MODEL_MAP.items():
+        label = _MODEL_LABELS.get(cfg['model_type'], cfg['model_type'])
+        features = []
+        if cfg['thinking_enabled']:
+            features.append('DeepThink')
+        if cfg['search_enabled']:
+            features.append('Search')
+        desc = f"DeepSeek {label}" + (" + " + " + ".join(features) if features else " - no thinking, no search")
+        models.append({
+            "id": mid,
             "object": "model",
             "created": 1740000000,
             "owned_by": "deepseek",
-            "description": "DeepSeek V4 Flash - no thinking, no search",
-            "model_type": "default",
-            "thinking_enabled": False,
-            "search_enabled": False,
-        },
-        {
-            "id": "deepseek-v4-flash-search",
-            "object": "model",
-            "created": 1740000000,
-            "owned_by": "deepseek",
-            "description": "DeepSeek V4 Flash + Search",
-            "model_type": "default",
-            "thinking_enabled": False,
-            "search_enabled": True,
-        },
-        {
-            "id": "deepseek-v4-flash-deepthink",
-            "object": "model",
-            "created": 1740000000,
-            "owned_by": "deepseek",
-            "description": "DeepSeek V4 Flash + DeepThink",
-            "model_type": "default",
-            "thinking_enabled": True,
-            "search_enabled": False,
-        },
-        {
-            "id": "deepseek-v4-flash-deepthink-search",
-            "object": "model",
-            "created": 1740000000,
-            "owned_by": "deepseek",
-            "description": "DeepSeek V4 Flash + DeepThink + Search",
-            "model_type": "default",
-            "thinking_enabled": True,
-            "search_enabled": True,
-        },
-        {
-            "id": "deepseek-v4-pro",
-            "object": "model",
-            "created": 1740000000,
-            "owned_by": "deepseek",
-            "description": "DeepSeek V4 Pro - no thinking, no search",
-            "model_type": "expert",
-            "thinking_enabled": False,
-            "search_enabled": False,
-        },
-        {
-            "id": "deepseek-v4-pro-deepthink",
-            "object": "model",
-            "created": 1740000000,
-            "owned_by": "deepseek",
-            "description": "DeepSeek V4 Pro + DeepThink",
-            "model_type": "expert",
-            "thinking_enabled": True,
-            "search_enabled": False,
-        },
-        {
-            "id": "deepseek-v4-pro-deepthink-search",
-            "object": "model",
-            "created": 1740000000,
-            "owned_by": "deepseek",
-            "description": "DeepSeek V4 Pro + DeepThink + Search",
-            "model_type": "expert",
-            "thinking_enabled": True,
-            "search_enabled": True,
-        },
-    ]
+            "description": desc,
+            "model_type": cfg['model_type'],
+            "thinking_enabled": cfg['thinking_enabled'],
+            "search_enabled": cfg['search_enabled'],
+        })
     return {"object": "list", "data": models}
 
 
@@ -418,15 +377,27 @@ def _extract_content(content):
     return content
 
 
-# OpenAI-compatible chat completions endpoint
-@app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+# --- Singleton DeepSeekAPI instance (avoids re-loading WASM per request) ---
+_api_lock = threading.Lock()
+_api_instance = None
+
+def _get_api() -> DeepSeekAPI:
+    """Get or create the singleton DeepSeekAPI instance."""
+    global _api_instance
     auth_token = os.getenv("DEEPSEEK_AUTH_TOKEN")
     if not auth_token:
         raise HTTPException(status_code=500, detail="DEEPSEEK_AUTH_TOKEN not set")
+    with _api_lock:
+        if _api_instance is None:
+            _api_instance = DeepSeekAPI(auth_token)
+    return _api_instance
 
+
+# OpenAI-compatible chat completions endpoint
+@app.post("/v1/chat/completions")
+async def chat_completions(request: ChatCompletionRequest):
     try:
-        api = DeepSeekAPI(auth_token)
+        api = _get_api()
         
         # Extract the last user message as the prompt
         user_messages = [msg for msg in request.messages if msg.role == "user"]
@@ -546,14 +517,12 @@ async def chat_completions(request: ChatCompletionRequest):
                     yield f"data: {final_chunk.model_dump_json()}\n\n"
                     yield "data: [DONE]\n\n"
                     
-                except AuthenticationError:
-                    raise HTTPException(status_code=401, detail="Invalid authentication token")
-                except RateLimitError:
-                    raise HTTPException(status_code=429, detail="Rate limit exceeded")
-                except NetworkError as e:
-                    raise HTTPException(status_code=503, detail=str(e))
-                except APIError as e:
-                    raise HTTPException(status_code=500, detail=str(e))
+                except (AuthenticationError, RateLimitError, NetworkError, APIError) as e:
+                    # Cannot raise HTTPException inside a streaming generator
+                    # (HTTP 200 status already sent) — yield an SSE error event instead
+                    error_data = {"error": {"message": str(e), "type": type(e).__name__}}
+                    yield f"data: {json.dumps(error_data)}\n\n"
+                    yield "data: [DONE]\n\n"
             
             return StreamingResponse(
                 stream_generator(),
@@ -607,10 +576,11 @@ async def chat_completions(request: ChatCompletionRequest):
                     message=ChatMessage(role="assistant", content=full_content, reasoning_content=reasoning_content or None),
                     finish_reason="stop"
                 )],
+                # Approximate token counts (word-based, not true tokenization)
                 usage=ChatCompletionResponseUsage(
                     prompt_tokens=len(prompt.split()),
-                    completion_tokens=len(full_content.split()),
-                    total_tokens=len(prompt.split()) + len(full_content.split())
+                    completion_tokens=len(full_content.split()) + len(reasoning_content.split()),
+                    total_tokens=len(prompt.split()) + len(full_content.split()) + len(reasoning_content.split())
                 )
             )
             
@@ -648,9 +618,6 @@ if __name__ == "__main__":
         print("Warning: pyvirtualdisplay not installed. Headless mode may not work properly.")
         print("Install it with: pip install pyvirtualdisplay")
 
-    if args.nolog:
-        log = False
-    else:
-        log = True
+    log = not args.nolog
 
     uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)
