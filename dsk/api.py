@@ -182,7 +182,8 @@ class DeepSeekAPI:
                     parent_message_id: Optional[Any] = None,
                     thinking_enabled: bool = True,
                     search_enabled: bool = False,
-                    model_type: ModelType = 'default') -> Generator[Dict[str, Any], None, None]:
+                    model_type: ModelType = 'default',
+                    system_prompt: Optional[str] = None) -> Generator[Dict[str, Any], None, None]:
         """
         Send a message and get streaming response
 
@@ -193,6 +194,7 @@ class DeepSeekAPI:
             thinking_enabled (bool): Whether to show the thinking process
             search_enabled (bool): Whether to enable web search for up-to-date information
             model_type (str): Model to use - 'default' for Instant (V4 Flash), 'expert' for V4 Pro
+            system_prompt (Optional[str]): Optional system prompt to prepend to the conversation
 
         The 7 available model variations are:
             1. V4 Flash: model_type='default', thinking_enabled=False, search_enabled=False
@@ -233,6 +235,7 @@ class DeepSeekAPI:
             'ref_file_ids': [],
             'thinking_enabled': thinking_enabled,
             'search_enabled': search_enabled,
+            'system_prompt': system_prompt or '',
             'preempt': False,
         }
 

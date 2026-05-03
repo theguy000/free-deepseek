@@ -32,7 +32,7 @@ from .api import DeepSeekAPI, AuthenticationError, RateLimitError, NetworkError,
 # Check if running in Docker mode
 DOCKER_MODE = os.getenv("DOCKERMODE", "false").lower() == "true"
 
-SERVER_PORT = int(os.getenv("SERVER_PORT", 8000))
+SERVER_PORT = int(os.getenv("SERVER_PORT", 5005))
 
 # Chromium options arguments
 arguments = [
@@ -408,6 +408,16 @@ async def list_models():
     return {"object": "list", "data": models}
 
 
+def _extract_content(content):
+    """Extract text from message content, handling both string and list formats."""
+    if isinstance(content, list):
+        return " ".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    return content
+
+
 # OpenAI-compatible chat completions endpoint
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
@@ -422,15 +432,11 @@ async def chat_completions(request: ChatCompletionRequest):
         user_messages = [msg for msg in request.messages if msg.role == "user"]
         if not user_messages:
             raise HTTPException(status_code=400, detail="No user message provided")
+        prompt = _extract_content(user_messages[-1].content)
         
-        raw_content = user_messages[-1].content
-        if isinstance(raw_content, list):
-            prompt = " ".join(
-                part.get("text", "") if isinstance(part, dict) else str(part)
-                for part in raw_content
-            )
-        else:
-            prompt = raw_content
+        # Extract system prompt from messages
+        system_messages = [msg for msg in request.messages if msg.role == "system"]
+        system_prompt = _extract_content(system_messages[-1].content) if system_messages else None
         
         # --- Resolve session ---
         if request.conversation_id:
@@ -472,7 +478,8 @@ async def chat_completions(request: ChatCompletionRequest):
                         parent_message_id=parent_message_id,
                         thinking_enabled=thinking_enabled,
                         search_enabled=search_enabled,
-                        model_type=model_type
+                        model_type=model_type,
+                        system_prompt=system_prompt
                     )
                     
                     # Send first chunk with role
@@ -572,7 +579,8 @@ async def chat_completions(request: ChatCompletionRequest):
                 parent_message_id=parent_message_id,
                 thinking_enabled=thinking_enabled,
                 search_enabled=search_enabled,
-                model_type=model_type
+                model_type=model_type,
+                system_prompt=system_prompt
             )
             
             for chunk in chunks:
