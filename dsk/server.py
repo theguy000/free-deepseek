@@ -222,6 +222,9 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[List[ToolDefinition]] = None
     tool_choice: Optional[Any] = None  # 'none', 'auto', 'required', or {'type':'function','function':{'name':'...'}}
     parallel_tool_calls: Optional[bool] = None
+    # ds-free-api compatible fields
+    reasoning_effort: Optional[str] = None  # "none" disables thinking; any other value (default "high") enables it
+    web_search_options: Optional[Any] = None  # dict with search_context_size; present=enabled, "none"=disabled
 
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -369,26 +372,52 @@ async def get_html(url: str, retries: int = 5, proxy: str = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Model name resolution helper
+# Model name resolution helper (matching ds-free-api model_types + model_aliases)
+# Only base model IDs and aliases; thinking/search controlled via reasoning_effort & web_search_options
 MODEL_MAP = {
-    'deepseek-v4-flash':              {'model_type': 'default', 'thinking_enabled': False, 'search_enabled': False},
-    'deepseek-v4-flash-search':       {'model_type': 'default', 'thinking_enabled': False, 'search_enabled': True},
-    'deepseek-v4-flash-deepthink':         {'model_type': 'default', 'thinking_enabled': True,  'search_enabled': False},
-    'deepseek-v4-flash-deepthink-search':  {'model_type': 'default', 'thinking_enabled': True,  'search_enabled': True},
-    'deepseek-v4-pro':                 {'model_type': 'expert',   'thinking_enabled': False, 'search_enabled': False},
-    'deepseek-v4-pro-deepthink':            {'model_type': 'expert',   'thinking_enabled': True,  'search_enabled': False},
-    'deepseek-v4-pro-deepthink-search':     {'model_type': 'expert',   'thinking_enabled': True,  'search_enabled': True},
+    'deepseek-default':   {'model_type': 'default'},
+    'deepseek-expert':    {'model_type': 'expert'},
+    'deepseek-v4-flash':  {'model_type': 'default'},
+    'deepseek-v4-pro':    {'model_type': 'expert'},
 }
 
-def _resolve_model(model: str, model_type=None, thinking_enabled=None, search_enabled=None):
+def _resolve_model(model: str, model_type=None, thinking_enabled=None, search_enabled=None,
+                   reasoning_effort: Optional[str] = None, web_search_options: Optional[Any] = None):
     """Resolve model name to (model_type, thinking_enabled, search_enabled).
-    Explicit params take precedence over model name mapping."""
-    resolved = MODEL_MAP.get(model.lower(), MODEL_MAP['deepseek-v4-flash'])
-    return (
-        model_type if model_type is not None else resolved['model_type'],
-        thinking_enabled if thinking_enabled is not None else resolved['thinking_enabled'],
-        search_enabled if search_enabled is not None else resolved['search_enabled'],
-    )
+
+    Resolution order (matching ds-free-api resolver.rs):
+      1. model_type from MODEL_MAP or explicit param
+      2. thinking_enabled: explicit param > reasoning_effort ("none"=off, else on) > default True
+      3. search_enabled: explicit param > web_search_options (present=on, "none"=off) > default True
+    """
+    resolved = MODEL_MAP.get(model.lower(), None)
+
+    # Determine model_type
+    resolved_model_type = resolved['model_type'] if resolved else 'default'
+    final_model_type = model_type if model_type is not None else resolved_model_type
+
+    # Determine thinking_enabled (ds-free-api: reasoning_effort defaults to "high", thinking on unless "none")
+    if thinking_enabled is not None:
+        final_thinking = thinking_enabled
+    elif reasoning_effort is not None:
+        final_thinking = reasoning_effort != 'none'
+    else:
+        final_thinking = True  # ds-free-api default: reasoning ON
+
+    # Determine search_enabled (ds-free-api: search ON by default for stronger system prompts)
+    if search_enabled is not None:
+        final_search = search_enabled
+    elif web_search_options is not None:
+        # web_search_options present → check for explicit disable
+        if isinstance(web_search_options, dict):
+            ctx_size = web_search_options.get('search_context_size', '')
+            final_search = ctx_size != 'none'
+        else:
+            final_search = True
+    else:
+        final_search = True  # ds-free-api default: search ON
+
+    return (final_model_type, final_thinking, final_search)
 
 
 # OpenAI-compatible models endpoint
@@ -398,12 +427,7 @@ async def list_models():
     models = []
     for mid, cfg in MODEL_MAP.items():
         label = _MODEL_LABELS.get(cfg['model_type'], cfg['model_type'])
-        features = []
-        if cfg['thinking_enabled']:
-            features.append('DeepThink')
-        if cfg['search_enabled']:
-            features.append('Search')
-        desc = f"DeepSeek {label}" + (" + " + " + ".join(features) if features else " - no thinking, no search")
+        desc = f"DeepSeek {label} (thinking & search on by default; disable via reasoning_effort/web_search_options)"
         models.append({
             "id": mid,
             "object": "model",
@@ -411,8 +435,6 @@ async def list_models():
             "owned_by": "deepseek",
             "description": desc,
             "model_type": cfg['model_type'],
-            "thinking_enabled": cfg['thinking_enabled'],
-            "search_enabled": cfg['search_enabled'],
         })
     return {"object": "list", "data": models}
 
@@ -1230,10 +1252,11 @@ async def chat_completions(
         created = int(time.time())
 
         # --- Resolve model params ---
-        # When tools are present, auto-enable search mode (ds-free-api behavior:
-        # DeepSeek injects stronger system prompts in search mode, improving tool compliance)
+        # ds-free-api behavior: thinking ON by default, search ON by default
+        # (DeepSeek injects stronger system prompts in search mode, improving tool compliance)
         model_type, thinking_enabled, search_enabled = _resolve_model(
-            request.model, request.model_type, request.thinking_enabled, request.search_enabled
+            request.model, request.model_type, request.thinking_enabled, request.search_enabled,
+            reasoning_effort=request.reasoning_effort, web_search_options=request.web_search_options
         )
         if has_tools and not search_enabled:
             search_enabled = True
