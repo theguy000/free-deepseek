@@ -55,6 +55,7 @@ class DeepSeekAPI:
 
         self.auth_token = auth_token
         self.pow_solver = DeepSeekPOW()
+        self._session_parent_ids: Dict[str, Optional[str]] = {}
 
         # Load cookies from JSON file
         cookies_path = Path(__file__).parent / 'cookies.json'
@@ -175,7 +176,7 @@ class DeepSeekAPI:
             response = self._make_request(
                 'POST',
                 '/chat_session/create',
-                {'character_id': None}
+                {}
             )
             return response['data']['biz_data']['id']
         except KeyError:
@@ -184,7 +185,7 @@ class DeepSeekAPI:
     def chat_completion(self,
                     chat_session_id: str,
                     prompt: str,
-                    parent_message_id: Optional[str] = None,
+                    parent_message_id: Optional[Any] = None,
                     thinking_enabled: bool = True,
                     search_enabled: bool = False) -> Generator[Dict[str, Any], None, None]:
         """
@@ -211,13 +212,19 @@ class DeepSeekAPI:
         if not chat_session_id or not isinstance(chat_session_id, str):
             raise ValueError("Chat session ID must be a non-empty string")
 
+        # Use stored parent_message_id for the session if not explicitly provided
+        if parent_message_id is None:
+            parent_message_id = self._session_parent_ids.get(chat_session_id)
+
         json_data = {
             'chat_session_id': chat_session_id,
             'parent_message_id': parent_message_id,
+            'model_type': None,
             'prompt': prompt,
             'ref_file_ids': [],
             'thinking_enabled': thinking_enabled,
             'search_enabled': search_enabled,
+            'preempt': False,
         }
 
         try:
@@ -250,6 +257,9 @@ class DeepSeekAPI:
                 try:
                     parsed = self._parse_chunk(chunk)
                     if parsed:
+                        # Track message_id for conversation threading
+                        if parsed.get('type') == 'message_id':
+                            self._session_parent_ids[chat_session_id] = parsed['message_id']
                         yield parsed
                         if parsed.get('finish_reason') == 'stop':
                             break
@@ -268,24 +278,40 @@ class DeepSeekAPI:
             if chunk.startswith(b'data: '):
                 data = json.loads(chunk[6:])
 
-                if 'v' in data and isinstance(data['v'], str):
-                    path = data.get('p', '')
-                    # Extract message_id for threading
-                    if path == 'response/message_id':
-                        return {
-                            'content': '',
-                            'type': 'message_id',
-                            'message_id': data['v'],
-                            'finish_reason': None
-                        }
-                    # Filter out metadata chunks (token usage, status, etc.)
-                    if path and path != 'response/content':
-                        return None
+                # Check for top-level response_message_id (first chunk of response)
+                if 'response_message_id' in data:
                     return {
-                        'content': data['v'],
-                        'type': 'text',
-                        'finish_reason': 'finish_reason'
+                        'content': '',
+                        'type': 'message_id',
+                        'message_id': data['response_message_id'],
+                        'finish_reason': None
                     }
+
+                if 'v' in data:
+                    path = data.get('p', '')
+
+                    # Handle dict values (initial response object with nested message_id)
+                    if isinstance(data['v'], dict):
+                        response_obj = data['v'].get('response', {})
+                        if 'message_id' in response_obj:
+                            return {
+                                'content': '',
+                                'type': 'message_id',
+                                'message_id': response_obj['message_id'],
+                                'finish_reason': None
+                            }
+                        return None
+
+                    # Handle string values as text content
+                    if isinstance(data['v'], str):
+                        # Filter out metadata chunks (token usage, status, etc.)
+                        if path and path not in ('response/content', ''):
+                            return None
+                        return {
+                            'content': data['v'],
+                            'type': 'text',
+                            'finish_reason': data.get('finish_reason')
+                        }
 
                 # Check for message_id at top level
                 if 'message_id' in data:

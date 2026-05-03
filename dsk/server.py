@@ -8,7 +8,7 @@ from collections import OrderedDict
 from urllib.parse import urlparse
 import sys
 
-from CloudflareBypasser import CloudflareBypasser
+from .CloudflareBypasser import CloudflareBypasser
 from DrissionPage import ChromiumPage, ChromiumOptions
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -147,11 +147,13 @@ class CookieResponse(BaseModel):
 
 # OpenAI-compatible models
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
+    model_config = {"extra": "ignore"}
+    role: Literal["system", "user", "assistant", "tool", "function"]
+    content: Union[str, List[Any]]
 
 
 class ChatCompletionRequest(BaseModel):
+    model_config = {"extra": "ignore"}
     model: str = "deepseek-chat"
     messages: List[ChatMessage]
     temperature: Optional[float] = 1.0
@@ -317,7 +319,14 @@ async def chat_completions(request: ChatCompletionRequest):
         if not user_messages:
             raise HTTPException(status_code=400, detail="No user message provided")
         
-        prompt = user_messages[-1].content
+        raw_content = user_messages[-1].content
+        if isinstance(raw_content, list):
+            prompt = " ".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in raw_content
+            )
+        else:
+            prompt = raw_content
         
         # --- Resolve session ---
         if request.conversation_id:
